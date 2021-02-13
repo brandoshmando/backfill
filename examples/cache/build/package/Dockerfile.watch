@@ -1,0 +1,14 @@
+FROM golang:1.15.7-alpine
+RUN apk update && apk add git
+RUN go get github.com/brandoshmando/fresh && \
+	go install github.com/brandoshmando/fresh
+
+WORKDIR /bin
+RUN echo "go mod download && fresh" | cat >> entrypoint.sh
+RUN chmod +x entrypoint.sh
+
+VOLUME /src/
+
+WORKDIR /src/examples/cache
+
+ENTRYPOINT "/bin/entrypoint.sh"
