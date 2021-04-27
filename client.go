@@ -7,13 +7,17 @@ import (
 	kafka_go "github.com/segmentio/kafka-go"
 )
 
-type cluster struct {
-	conn    *kafka_go.Conn
-	topic   string
-	groupID string
+type client interface {
+	addrs() ([]string, error)
+	fetchPartitions(topic string) ([]kafka_go.Partition, error)
+	fetchLatestOffsets(topic string, partitions []kafka_go.Partition) (map[int]int64, error)
 }
 
-func (c *cluster) Addrs() ([]string, error) {
+type cluster struct {
+	conn *kafka_go.Conn
+}
+
+func (c *cluster) addrs() ([]string, error) {
 	brokers, err := c.conn.Brokers()
 	if err != nil {
 		return make([]string, 0), err
@@ -27,20 +31,20 @@ func (c *cluster) Addrs() ([]string, error) {
 	return addrs, nil
 }
 
-func (c *cluster) fetchPartitions() ([]kafka_go.Partition, error) {
+func (c *cluster) fetchPartitions(topic string) ([]kafka_go.Partition, error) {
 	b, err := c.conn.Controller()
 	if err != nil {
 		return []kafka_go.Partition{}, err
 	}
 
-	return kafka_go.LookupPartitions(context.TODO(), "tcp", addrFromBroker(b), c.topic)
+	return kafka_go.LookupPartitions(context.TODO(), "tcp", addrFromBroker(b), topic)
 }
 
 func addrFromBroker(b kafka_go.Broker) string {
 	return fmt.Sprintf("%s:%d", b.Host, b.Port)
 }
 
-func (c *cluster) fetchLastOffsets(partitions []kafka_go.Partition) (map[int]int64, error) {
+func (c *cluster) fetchLatestOffsets(topic string, partitions []kafka_go.Partition) (map[int]int64, error) {
 	b, err := c.conn.Controller()
 	if err != nil {
 		return make(map[int]int64), err
@@ -53,23 +57,32 @@ func (c *cluster) fetchLastOffsets(partitions []kafka_go.Partition) (map[int]int
 
 	for _, p := range partitions {
 		r := kafka_go.LastOffsetOf(p.ID)
-		req.Topics[c.topic] = append(req.Topics[c.topic], r)
+		req.Topics[topic] = append(req.Topics[topic], r)
 	}
 
-	last := make(map[int]int64)
+	latest := make(map[int]int64)
 	res, err := client.ListOffsets(context.TODO(), &req)
 	if err != nil {
-		return last, err
+		return latest, err
 	}
 
-	offsets, ok := res.Topics[c.topic]
+	offsets, ok := res.Topics[topic]
 	if !ok {
-		return last, fmt.Errorf("could not fetch last offsets: topic %s does not exist", c.topic)
+		return latest, fmt.Errorf("could not fetch latest offsets: topic %s does not exist", topic)
 	}
 
 	for _, r := range offsets {
-		last[r.Partition] = r.LastOffset
+		latest[r.Partition] = r.LastOffset
 	}
 
-	return last, nil
+	return latest, nil
+}
+
+func newCluster(host string) (*cluster, error) {
+	conn, err := kafka_go.Dial("tcp", host)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cluster{conn}, nil
 }

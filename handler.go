@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	kafka_go "github.com/segmentio/kafka-go"
 )
 
-type Message struct {
-	kafka_go.Message
-}
+type Message = kafka_go.Message
 
 type HandlerFunc func(m Message)
 
@@ -18,7 +17,8 @@ func DefaultHandlerFunc(_ Message) {}
 type Handler struct {
 	backfill HandlerFunc
 	process  HandlerFunc
-	cluster  *cluster
+	config   Config
+	cluster  client
 	filled   chan struct{}
 	stop     chan struct{}
 	errors   chan error
@@ -47,6 +47,56 @@ func (h *Handler) WithProcessor(f HandlerFunc) *Handler {
 	return h
 }
 
+func initMeter(c client, topic string) (Meter, error) {
+	m := make(Meter)
+
+	partitions, err := c.fetchPartitions(topic)
+	if err != nil {
+		return m, err
+	}
+
+	offsets, err := c.fetchLatestOffsets(topic, partitions)
+	if err != nil {
+		return m, err
+	}
+
+	for p, l := range offsets {
+		m.withPartition(p, l)
+	}
+
+	return m, nil
+}
+
+func handle(h *Handler, meter Meter, m Message) {
+	process := func() {
+		f := h.backfill
+		if h.process != nil {
+			f = h.process
+		}
+
+		f(m)
+	}
+
+	if meter.exhausted() {
+		process()
+		return
+	}
+
+	switch meter.increment(m.Partition) {
+	case 0:
+		panic(fmt.Sprintf("meter failed to increment for partition %d", m.Partition))
+	case -2:
+		process()
+		return
+	}
+
+	h.backfill(m)
+
+	if meter.exhausted() {
+		close(h.filled)
+	}
+}
+
 func (h *Handler) Start(ctx context.Context) error {
 	// setup necessary kafka clients / connections
 	// fetch last offsets and instantiate/populate meter
@@ -61,12 +111,7 @@ func (h *Handler) Start(ctx context.Context) error {
 	// get controller
 	// conn.Controller addr for API requests / Writes
 	// conn.Brokers for reader broker list
-	meter, err := initMeter(h.cluster)
-	if err != nil {
-		return err
-	}
-
-	addrs, err := h.cluster.Addrs()
+	addrs, err := h.cluster.addrs()
 	if err != nil {
 		return err
 	}
@@ -74,12 +119,17 @@ func (h *Handler) Start(ctx context.Context) error {
 	// TODO: make this more configurable
 	r := kafka_go.NewReader(kafka_go.ReaderConfig{
 		Brokers:  addrs,
-		Topic:    h.cluster.topic,
-		GroupID:  h.cluster.groupID,
+		Topic:    h.config.Topic,
+		GroupID:  h.config.GroupID,
 		MinBytes: 10e3, // 10KB
 		MaxBytes: 10e6, // 10MB
 	})
 	r.SetOffset(kafka_go.LastOffset)
+
+	meter, err := initMeter(h.cluster, h.config.Topic)
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -95,33 +145,7 @@ func (h *Handler) Start(ctx context.Context) error {
 				break
 			}
 
-			process := func() {
-				safe := h.backfill
-				if h.process != nil {
-					safe = h.process
-				}
-
-				safe(Message{m})
-			}
-
-			if meter.exhausted() {
-				process()
-				continue
-			}
-
-			switch meter.increment(m.Partition) {
-			case 0:
-				panic(fmt.Sprintf("meter failed to increment for partition %d", m.Partition))
-			case -2:
-				process()
-				continue
-			}
-
-			h.backfill(Message{m})
-
-			if meter.exhausted() {
-				close(h.filled)
-			}
+			handle(h, meter, m)
 		}
 	}()
 
@@ -132,15 +156,20 @@ func (h *Handler) Stop() {
 	close(h.stop)
 }
 
+func namespacedGroupID(ns string) string {
+	return fmt.Sprintf("_backfill.%s.%s", ns, uuid.New().String())
+}
+
 func NewHandler(c Config) (*Handler, error) {
-	conn, err := kafka_go.Dial("tcp", c.Host)
+	cluster, err := newCluster(c.Host)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Handler{
 		backfill: DefaultHandlerFunc,
-		cluster:  &cluster{conn, c.Topic, namespacedGroupID(c.Namespace)},
+		config:   c,
+		cluster:  cluster,
 		filled:   make(chan struct{}, 1),
 		stop:     make(chan struct{}),
 		errors:   make(chan error, 1),
